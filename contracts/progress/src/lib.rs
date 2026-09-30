@@ -8,7 +8,7 @@ pub use errors::ProgressError;
 use scoutchain_shared_types::{
     require_admin, safe_math::safe_add_u32, write_wiring_link, ContractHealth, ProgressLevel,
 };
-pub use types::{DataKey, HistoryProofStep, ProgressEntry, ProgressWiringState};
+pub use types::{DataKey, FrontierPeak, HistoryProofStep, ProgressEntry, ProgressWiringState};
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
@@ -679,20 +679,62 @@ impl ProgressContract {
     ///
     /// This is a read-only convenience for callers who do not want to
     /// re-implement the tree construction off-chain (an indexer, a test, a
-    /// dispute-resolution UI); it recomputes the proof on demand from
-    /// `HistoryVec` rather than storing it, since storing a proof per entry
-    /// would require rewriting every prior entry's proof on each append.
+    /// dispute-resolution UI); it recomputes the proof on demand from the
+    /// `HistoryPage` shards rather than storing it, since storing a proof per
+    /// entry would require rewriting every prior entry's proof on each append.
     /// `verify_history_proof` does not depend on this function — it accepts
     /// any structurally valid proof from any source.
+    ///
+    /// ## Bounded history length (issue #1368)
+    ///
+    /// Proof generation is inherently O(n): the sibling at each level is the
+    /// root of an interior subtree the [`FrontierPeak`] accumulator does not
+    /// retain. The append path no longer pays that cost, but this *view* still
+    /// does, so it is bounded explicitly.
+    ///
+    /// `MAX_HISTORY_PROOF_ENTRIES` is set well above any history a legitimate
+    /// caller can build: a player accrues at most one entry per level
+    /// transition, and the level enum has four variants, so ordinary play
+    /// yields single-digit counts. Repeated `reset_player_level` calls are the
+    /// only unbounded growth path, and those are admin-only.
+    ///
+    /// Callers needing a proof for a player past this bound should use
+    /// `get_history_page_with_cursor` to stream the history and build the
+    /// proof off-chain — the leaf hashes are fully specified by
+    /// `verify_history_proof`'s replay, so this stays a convenience path
+    /// rather than part of the verification guarantee.
     pub fn get_history_proof(
         env: Env,
         player_id: u64,
         index: u32,
     ) -> Result<Vec<HistoryProofStep>, ProgressError> {
+        /// Upper bound on the history length for which a proof is generated
+        /// on-chain. See the doc comment above.
+        const MAX_HISTORY_PROOF_ENTRIES: u32 = 512;
+
+        // Check the counter BEFORE materialising the pages. Reading the pages
+        // is itself O(n), so guarding afterwards would bound nothing — the
+        // expensive work would already have been paid. `HistoryCounter` is a
+        // single O(1) read, so the common rejection path is cheap.
+        let counter: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HistoryCounter(player_id))
+            .unwrap_or(0u32);
+        if counter > MAX_HISTORY_PROOF_ENTRIES {
+            return Err(ProgressError::HistoryTooLongForProof);
+        }
+
         let history = Self::read_history_pages(&env, player_id);
         let n = history.len();
         if n == 0 || index == 0 || index > n {
             return Err(ProgressError::PlayerNotFound);
+        }
+        // The counter and the reconstructed length normally agree, but a
+        // player predating `HistoryCounter` can have a populated `HistoryVec`
+        // with a zero counter, so re-check what was actually materialised.
+        if n > MAX_HISTORY_PROOF_ENTRIES {
+            return Err(ProgressError::HistoryTooLongForProof);
         }
 
         let leaves = Self::leaf_hashes(&env, &history);
@@ -933,13 +975,26 @@ impl ProgressContract {
             .extend_ttl(&vec_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         // ── Recompute and persist Merkle root ─────────────────────────────────
+        // Replay the incremental frontier over the whole seeded history. The
+        // replay path reconstructs arbitrary history during a migration, so it
+        // legitimately sees every leaf; it still records the resulting
+        // `HistoryFrontier` so later appends against the migrated player stay
+        // incremental rather than paying this cost again.
         let root_key = DataKey::HistoryRoot(player_id);
-        let leaves = Self::leaf_hashes(&env, &history);
-        let root = Self::mth_range(&env, &leaves, 0, leaves.len());
+        let frontier = Self::build_frontier(&env, &history, history.len());
+        let root = Self::frontier_root(&env, &frontier);
         env.storage().persistent().set(&root_key, &root);
         env.storage()
             .persistent()
             .extend_ttl(&root_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        let frontier_key = DataKey::HistoryFrontier(player_id);
+        env.storage().persistent().set(&frontier_key, &frontier);
+        env.storage().persistent().extend_ttl(
+            &frontier_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         // ── Merkle root verification ──────────────────────────────────────────
         // If the caller supplied an expected root, compare it against the root
@@ -1178,20 +1233,21 @@ impl ProgressContract {
 
     /// RFC 6962 Merkle Tree Hash (MTH) of `leaves[start..end]`.
     ///
-    /// Recomputed from scratch on every call rather than maintained
-    /// incrementally (e.g. via an MMR peaks accumulator): this contract's
-    /// `record_progress_entry` already reads and rewrites the player's full
-    /// `HistoryVec` on every append for an unrelated, pre-existing reason
-    /// (`get_progress_history`'s O(1)-read optimization — see that key's
-    /// doc comment), so the leaf list is already fully materialized in
-    /// memory at zero extra storage cost. Recomputing `O(n)` leaf/node
-    /// hashes on top of that is `O(n)` extra CPU with no extra storage I/O,
-    /// which is cheaper than the storage cost an incremental accumulator
-    /// would need to persist and is simpler to get correct — and `n` is
-    /// bounded in practice to a handful of entries (three tier advances,
-    /// plus any admin dispute-resolution resets via `reset_player_level`),
-    /// not an unbounded log. See `ci/cpu-cost-budget.md` for the measured
-    /// cost this adds to `advance_level`.
+    /// This is the **reference** construction: a direct transcription of the
+    /// RFC's recursive definition, recomputed from scratch over the whole leaf
+    /// list every time it is called. It is deliberately retained after the
+    /// incremental-accumulator change (issue #1368) for two reasons:
+    ///
+    /// 1. It is the oracle the frontier's correctness is defined against —
+    ///    `tests/merkle_frontier_equivalence.rs` asserts the two agree for
+    ///    every `n` in `1..=256`.
+    /// 2. Proof generation still needs arbitrary sub-range roots, which the
+    ///    frontier cannot supply for interior nodes.
+    ///
+    /// The live append path no longer calls it. Appends maintain a
+    /// [`FrontierPeak`] list instead (see `frontier_root` /
+    /// `frontier_append`), which is O(log n) hashes and zero extra storage
+    /// reads.
     fn mth_range(env: &Env, leaves: &Vec<BytesN<32>>, start: u32, end: u32) -> BytesN<32> {
         let n = end - start;
         if n == 1 {
@@ -1201,6 +1257,140 @@ impl ProgressContract {
         let left = Self::mth_range(env, leaves, start, start + k);
         let right = Self::mth_range(env, leaves, start + k, end);
         Self::node_hash(env, &left, &right)
+    }
+
+    /// Derive the RFC 6962 Merkle Tree Hash root from a frontier, without
+    /// touching the leaf list.
+    ///
+    /// ## Why this equals `mth_range`
+    ///
+    /// `mth_range` splits a range of `n` leaves at `k = largest_pow2_lt(n)`.
+    /// The left child is then a *perfect* tree of `k = 2^b` leaves, and
+    /// recursing on the right child peels off the next-lower power of two.
+    /// So the recursion is exactly a decomposition of `n` into the powers of
+    /// two in its binary expansion, each represented by a perfect subtree
+    /// root — and the set of those levels is precisely the set bits of `n`.
+    /// That set is what a [`FrontierPeak`] list holds.
+    ///
+    /// The recursion combines them with the *larger* subtree as the left
+    /// operand and the accumulated remainder as the right operand, repeatedly,
+    /// starting from the smallest power of two. So the fold runs **forward**
+    /// over the ascending frontier: start at the lowest peak, then repeatedly
+    /// wrap `node(next_higher_peak, acc)`.
+    ///
+    /// Worked example, `n = 7` (set bits `{2,1,0}`):
+    /// `mth_range` splits at `k=4`, giving `MTH(0..4) = p2` and
+    /// `MTH(4..7)`, which splits at 1 giving `MTH(5..7) = node(p1, p0)`.
+    /// Root = `node(p2, node(p1, p0))`. The forward fold over ascending
+    /// `[p0, p1, p2]` yields exactly that.
+    ///
+    /// Returns 32 zero bytes for an empty frontier, mirroring
+    /// `get_progress_root`'s default for a player with no history.
+    fn frontier_root(env: &Env, frontier: &Vec<FrontierPeak>) -> BytesN<32> {
+        let len = frontier.len();
+        if len == 0 {
+            return BytesN::from_array(env, &[0u8; 32]);
+        }
+        let mut acc = frontier.get(0).unwrap().hash;
+        for i in 1..len {
+            acc = Self::node_hash(env, &frontier.get(i).unwrap().hash, &acc);
+        }
+        acc
+    }
+
+    /// Append one leaf to the frontier, collapsing peaks the way a binary
+    /// counter carries (issue #1368).
+    ///
+    /// A frontier holds at most one peak per level, with levels ascending, so
+    /// after appending leaf number `n` its level set is exactly the set bits
+    /// of `n` — the invariant `frontier_root` depends on.
+    ///
+    /// The loop is a classic MMR append: carry the new leaf at level 0; if the
+    /// frontier already holds a peak at the carry's level, merge it
+    /// (`node_hash` of the existing peak on the left — it is the older, and so
+    /// leftward, subtree — and the carry on the right) and retry one level
+    /// up; otherwise insert the carry. Each iteration removes one peak, so the
+    /// work is bounded by the frontier height, i.e. O(log n) hashes.
+    ///
+    /// After the loop every remaining peak is strictly above the carry's
+    /// level, so inserting at index 0 preserves ascending order.
+    fn frontier_append(env: &Env, frontier: &mut Vec<FrontierPeak>, leaf: BytesN<32>) {
+        let mut carry_level: u32 = 0;
+        let mut carry_hash = leaf;
+
+        loop {
+            // Peaks are ascending by level, so the (at most one) peak matching
+            // the carry level is found by scanning down from the top.
+            let mut match_idx: i64 = -1;
+            let mut j = frontier.len();
+            while j > 0 {
+                if frontier.get(j - 1).unwrap().level == carry_level {
+                    match_idx = (j - 1) as i64;
+                    break;
+                }
+                j -= 1;
+            }
+
+            if match_idx < 0 {
+                frontier.insert(
+                    0,
+                    FrontierPeak {
+                        level: carry_level,
+                        hash: carry_hash,
+                    },
+                );
+                return;
+            }
+
+            let existing = frontier.get(match_idx as u32).unwrap();
+            carry_hash = Self::node_hash(env, &existing.hash, &carry_hash);
+            carry_level += 1;
+            frontier.remove(match_idx as u32);
+        }
+    }
+
+    /// Build a frontier from a full history by replaying `frontier_append`
+    /// over its first `count` leaves.
+    ///
+    /// This is the **upgrade path** for a player whose `HistoryFrontier` key
+    /// does not yet exist: their root is recomputed once from the history that
+    /// is already on-chain, and every subsequent append is incremental. It
+    /// costs O(n) exactly once, the same cost the old code paid on *every*
+    /// append.
+    ///
+    /// `count` is clamped to the history length so a caller that has already
+    /// written the entry being appended does not fold that entry in twice.
+    fn build_frontier(env: &Env, history: &Vec<ProgressEntry>, count: u32) -> Vec<FrontierPeak> {
+        let mut frontier: Vec<FrontierPeak> = Vec::new(env);
+        let bound = count.min(history.len());
+        for i in 0..bound {
+            let e = history.get(i).unwrap();
+            let leaf = Self::leaf_hash(env, &e);
+            Self::frontier_append(env, &mut frontier, leaf);
+        }
+        frontier
+    }
+
+    /// Load the frontier to append onto, rebuilding it lazily if absent.
+    ///
+    /// `prior_count` is the number of history entries committed *before* this
+    /// append, so a lazy rebuild folds exactly the pre-existing leaves and not
+    /// the entry being appended (which is already written to its page by the
+    /// time this runs).
+    fn load_or_build_frontier(env: &Env, player_id: u64, prior_count: u32) -> Vec<FrontierPeak> {
+        let key = DataKey::HistoryFrontier(player_id);
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<FrontierPeak>>(&key)
+        {
+            return existing;
+        }
+        if prior_count == 0 {
+            return Vec::new(env);
+        }
+        let history = Self::read_history_pages(env, player_id);
+        Self::build_frontier(env, &history, prior_count)
     }
 
     /// RFC 6962 audit path (`PATH`) for leaf `index` within `leaves[start..end]`,
@@ -1338,18 +1528,28 @@ impl ProgressContract {
             .persistent()
             .extend_ttl(&page_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
-        // Recompute the Merkle commitment root over the full (now-updated)
-        // logical history from the page shards. This preserves the existing
-        // proof semantics while preventing a single persistent key from growing
-        // without bound.
+        // Maintain the incremental Merkle commitment (issue #1368). The new
+        // leaf is folded onto the existing frontier in O(log n) hashes, and
+        // the RFC 6962 root is derived from the resulting peaks — byte-identical
+        // to the root the old full-history `mth_range` produced, but without
+        // reading back every `HistoryPage` shard on each append.
         let root_key = DataKey::HistoryRoot(player_id);
-        let history = Self::read_history_pages(env, player_id);
-        let leaves = Self::leaf_hashes(env, &history);
-        let root = Self::mth_range(env, &leaves, 0, leaves.len());
+        let mut frontier = Self::load_or_build_frontier(env, player_id, index);
+        let leaf = Self::leaf_hash(env, &entry);
+        Self::frontier_append(env, &mut frontier, leaf);
+        let root = Self::frontier_root(env, &frontier);
         env.storage().persistent().set(&root_key, &root);
         env.storage()
             .persistent()
             .extend_ttl(&root_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        let frontier_key = DataKey::HistoryFrontier(player_id);
+        env.storage().persistent().set(&frontier_key, &frontier);
+        env.storage().persistent().extend_ttl(
+            &frontier_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         Ok(())
     }
@@ -1531,6 +1731,25 @@ mod tests {
         // registered on the verification contract above.
         let validator = Address::generate(&env);
         (env, client, validator)
+    }
+
+    /// Minimal harness for tests that need to touch contract storage directly
+    /// (to simulate a pre-upgrade state, or to push a counter past a bound).
+    /// Such access must be wrapped in `env.as_contract`, and the contract ID
+    /// is needed for that — hence this variant, which returns it.
+    ///
+    /// No verification contract is wired: the tests that use this drive
+    /// `reset_player_level` (admin-only, and it skips the cross-contract level
+    /// sync when `RegistrationContract` is unset), which is the only path that
+    /// grows history without bound.
+    fn setup_for_storage_tests() -> (Env, ProgressContractClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(ProgressContract, ());
+        let client = ProgressContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        (env, client, id)
     }
 
     #[test]
@@ -2518,5 +2737,276 @@ mod tests {
 
         // Verify that subsequent reads also work (keep-alive is continuous).
         assert_eq!(client.get_level(&1u64), ProgressLevel::EliteTier);
+    }
+
+    // =====================================================================
+    // Incremental Merkle frontier vs. the RFC 6962 reference (issue #1368)
+    // =====================================================================
+
+    /// Build `n` deterministic, pairwise-distinct history entries for
+    /// `player_id`. Every field that feeds `leaf_hash` varies with `i` so no
+    /// two leaves in a generated history can collide.
+    fn synthetic_history(env: &Env, player_id: u64, n: u32) -> Vec<ProgressEntry> {
+        let updater = Address::generate(env);
+        let mut history: Vec<ProgressEntry> = Vec::new(env);
+        for i in 0..n {
+            history.push_back(ProgressEntry {
+                player_id,
+                old_level: ProgressLevel::Unverified,
+                new_level: if i % 2 == 0 {
+                    ProgressLevel::VerifiedIdentity
+                } else {
+                    ProgressLevel::PerformanceMilestones
+                },
+                updated_by: updater.clone(),
+                updated_at: 1_700_000_000u64 + i as u64,
+                milestone_ref: i + 1,
+                ledger_sequence: i + 1,
+            });
+        }
+        history
+    }
+
+    /// Reference leaf list for `history`, via the same helper the contract
+    /// uses. `soroban_sdk::Vec` has no `FromIterator`, so tests build these by
+    /// `push_back` through the contract's own helper.
+    fn leaves_for(env: &Env, history: &Vec<ProgressEntry>) -> Vec<BytesN<32>> {
+        ProgressContract::leaf_hashes(env, history)
+    }
+
+    /// Core property from the issue's acceptance criteria: the root derived
+    /// from the frontier is byte-identical to the root the recursive
+    /// `mth_range` reference produces, for every `n` in `1..=256`.
+    ///
+    /// This is the check that licenses dropping the full recompute from the
+    /// append path — if the two constructions ever diverge for some leaf
+    /// count, an already-committed root would no longer be reproducible by an
+    /// off-chain verifier, so this test is the contract's real safety net.
+    #[test]
+    fn frontier_root_is_byte_identical_to_mth_range_for_all_n_up_to_256() {
+        let env = Env::default();
+        // 256 lengths x 256 leaves x 2 hashes each is far past the default
+        // test budget, and the point of this test is the algebra, not the cost.
+        env.cost_estimate().budget().reset_unlimited();
+        for n in 1..=256u32 {
+            let history = synthetic_history(&env, 7u64, n);
+            let leaves = ProgressContract::leaf_hashes(&env, &history);
+            let reference = ProgressContract::mth_range(&env, &leaves, 0, n);
+
+            let mut frontier: Vec<FrontierPeak> = Vec::new(&env);
+            for i in 0..n {
+                let e = history.get(i).unwrap();
+                let leaf = ProgressContract::leaf_hash(&env, &e);
+                ProgressContract::frontier_append(&env, &mut frontier, leaf);
+            }
+            let incremental = ProgressContract::frontier_root(&env, &frontier);
+
+            assert_eq!(
+                incremental, reference,
+                "frontier root diverged from mth_range at n={n}"
+            );
+        }
+    }
+
+    /// The invariant `frontier_root` is derived from: after `n` appends the
+    /// frontier's peak levels are exactly the set bits of `n`, strictly
+    /// ascending. This bounds the frontier at `popcount(n) <= 32` entries and
+    /// is what makes appends O(log n).
+    #[test]
+    fn frontier_levels_are_the_set_bits_of_the_leaf_count() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        for n in 1..=256u32 {
+            let history = synthetic_history(&env, 7u64, n);
+            let mut frontier: Vec<FrontierPeak> = Vec::new(&env);
+            for i in 0..n {
+                let e = history.get(i).unwrap();
+                let leaf = ProgressContract::leaf_hash(&env, &e);
+                ProgressContract::frontier_append(&env, &mut frontier, leaf);
+            }
+
+            let expected: u32 = (0..32).filter(|b| n & (1u32 << b) != 0).count() as u32;
+            assert_eq!(
+                frontier.len(),
+                expected,
+                "frontier length must equal popcount(n) at n={n}"
+            );
+            assert!(
+                frontier.len() <= 32,
+                "frontier must stay within 32 peaks at n={n}"
+            );
+
+            // Strictly ascending, no duplicate levels.
+            for i in 0..frontier.len() {
+                if i > 0 {
+                    assert!(
+                        frontier.get(i - 1).unwrap().level < frontier.get(i).unwrap().level,
+                        "frontier levels must be strictly ascending at n={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `frontier_append` must be correct when replayed in one pass *and* when
+    /// built by `build_frontier` from an existing history — the second is the
+    /// upgrade path, and both must land on the same state.
+    #[test]
+    fn build_frontier_matches_incremental_appends() {
+        let env = Env::default();
+        for n in [1u32, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 100, 255, 256] {
+            let history = synthetic_history(&env, 3u64, n);
+            let incremental = ProgressContract::build_frontier(&env, &history, n);
+            let leaves = ProgressContract::leaf_hashes(&env, &history);
+            assert_eq!(
+                ProgressContract::frontier_root(&env, &incremental),
+                ProgressContract::mth_range(&env, &leaves, 0, n),
+                "build_frontier diverged from mth_range at n={n}"
+            );
+        }
+    }
+
+    /// End-to-end through the public API: repeatedly resetting a player's
+    /// level (the only unbounded history-growth path) must leave
+    /// `get_progress_root` equal to an independently recomputed reference
+    /// root, and every entry's inclusion proof must still verify.
+    #[test]
+    fn live_appends_keep_root_and_proofs_consistent() {
+        let (env, client, _validator) = setup();
+        let player = 42u64;
+        // reset_player_level is the admin-only path that grows history without
+        // bound — exactly the growth #1368 is about.
+        for _ in 0..12 {
+            client.reset_player_level(&player, &ProgressLevel::VerifiedIdentity);
+        }
+        let n = client.get_history_count(&player);
+        assert_eq!(n, 12);
+
+        // Independently recompute the reference root from the public history
+        // view and compare against what the contract committed.
+        let history = client.get_progress_history(&player);
+        assert_eq!(history.len(), 12);
+        let leaves = leaves_for(&env, &history);
+        let reference = ProgressContract::mth_range(&env, &leaves, 0, 12);
+        assert_eq!(
+            client.get_progress_root(&player),
+            reference,
+            "committed root must match the RFC 6962 reference after live appends"
+        );
+
+        // Inclusion proofs still verify for every entry.
+        for i in 1..=12u32 {
+            let entry = client.get_history_entry(&player, &i);
+            let proof = client.get_history_proof(&player, &i);
+            assert!(
+                client.verify_history_proof(&player, &entry, &proof),
+                "proof for entry {i} failed to verify"
+            );
+        }
+    }
+
+    /// Lazy upgrade path: a player whose `HistoryFrontier` key is absent
+    /// (history written by the pre-#1368 code) must get a correct frontier
+    /// built on the next append, with no change to the committed root's
+    /// meaning.
+    #[test]
+    fn frontier_is_lazily_rebuilt_on_first_append_after_upgrade() {
+        let (env, client, id) = setup_for_storage_tests();
+        let player = 55u64;
+        for _ in 0..5 {
+            client.reset_player_level(&player, &ProgressLevel::VerifiedIdentity);
+        }
+
+        // Simulate the pre-upgrade state: drop the accumulator, leaving the
+        // history entries, pages, counter and root exactly as they were.
+        env.as_contract(&id, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::HistoryFrontier(player));
+        });
+
+        // The root is untouched by the missing accumulator.
+        let root_before = client.get_progress_root(&player);
+
+        // Next append must rebuild the frontier rather than skip or mis-fold it.
+        client.reset_player_level(&player, &ProgressLevel::VerifiedIdentity);
+        let n = client.get_history_count(&player);
+        assert_eq!(n, 6);
+
+        let history = client.get_progress_history(&player);
+        let leaves = leaves_for(&env, &history);
+        assert_eq!(
+            client.get_progress_root(&player),
+            ProgressContract::mth_range(&env, &leaves, 0, 6),
+            "lazily rebuilt frontier produced the wrong root"
+        );
+        // Sanity: the rebuild actually changed the root (i.e. the append was
+        // folded in, not skipped).
+        assert_ne!(client.get_progress_root(&player), root_before);
+
+        // And the accumulator is now persisted for subsequent appends.
+        assert!(env.as_contract(&id, || {
+            env.storage()
+                .persistent()
+                .has(&DataKey::HistoryFrontier(player))
+        }));
+    }
+
+    /// After a lazy rebuild, a second append must be incremental from the
+    /// persisted frontier and still agree with the reference.
+    #[test]
+    fn appends_after_a_lazy_rebuild_stay_incremental() {
+        let (env, client, id) = setup_for_storage_tests();
+        let player = 55u64;
+        for _ in 0..5 {
+            client.reset_player_level(&player, &ProgressLevel::VerifiedIdentity);
+        }
+        env.as_contract(&id, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::HistoryFrontier(player));
+        });
+
+        for _ in 0..3 {
+            client.reset_player_level(&player, &ProgressLevel::VerifiedIdentity);
+        }
+        let n = client.get_history_count(&player);
+        assert_eq!(n, 8);
+
+        let history = client.get_progress_history(&player);
+        let leaves = leaves_for(&env, &history);
+        assert_eq!(
+            client.get_progress_root(&player),
+            ProgressContract::mth_range(&env, &leaves, 0, 8)
+        );
+    }
+
+    /// The frontier is bounded, so `get_history_proof`'s new length guard is
+    /// reachable only past a deliberately grown history. 512 is the bound;
+    /// this asserts the guard rejects rather than silently truncating.
+    #[test]
+    fn get_history_proof_rejects_histories_past_its_bound() {
+        let (env, client, id) = setup_for_storage_tests();
+        let player = 20u64;
+        for _ in 0..4 {
+            client.reset_player_level(&player, &ProgressLevel::VerifiedIdentity);
+        }
+        // Below the bound: proof generation succeeds.
+        let ok = client.try_get_history_proof(&player, &2u32);
+        assert!(ok.is_ok());
+
+        // Simulate a history past the bound by writing the counter forward and
+        // confirming the guard trips before any O(n) work happens.
+        env.as_contract(&id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::HistoryCounter(player), &10_000u32);
+        });
+        let err = client.try_get_history_proof(&player, &1u32);
+        assert_eq!(
+            err,
+            Err(Ok(ProgressError::HistoryTooLongForProof)),
+            "proof generation must refuse histories past its documented bound"
+        );
     }
 }

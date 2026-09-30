@@ -55,6 +55,12 @@ pub enum ProgressError {
     /// archival grace period has fully elapsed (evicted, not merely archived)
     /// and is unrecoverable.
     PlayerLevelRecordEvicted = 15,
+    /// The player's progress history is longer than `get_history_proof` will
+    /// build a proof for on-chain (issue #1368). Proof generation is O(n) in
+    /// the history length; the append path is incremental, but this view
+    /// function is not, so it is explicitly bounded. Stream the history with
+    /// `get_history_page_with_cursor` and build the proof off-chain instead.
+    HistoryTooLongForProof = 16,
 }
 
 impl AdminError for ProgressError {
@@ -79,5 +85,10 @@ mod tests {
         assert_eq!(ProgressError::Overflow as u32, 8);
         assert_eq!(ProgressError::RegistrationCallFailed as u32, 9);
         assert_eq!(ProgressError::PendingAdminNotSet as u32, 10);
+        assert_eq!(ProgressError::HistoryAlreadyExists as u32, 12);
+        assert_eq!(ProgressError::MerkleRootMismatch as u32, 13);
+        assert_eq!(ProgressError::InvalidHistoryIndex as u32, 14);
+        assert_eq!(ProgressError::PlayerLevelRecordEvicted as u32, 15);
+        assert_eq!(ProgressError::HistoryTooLongForProof as u32, 16);
     }
 }

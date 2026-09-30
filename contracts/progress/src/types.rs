@@ -37,6 +37,30 @@ pub struct ProgressEntry {
     pub ledger_sequence: u32,
 }
 
+/// One peak of a player's incremental Merkle frontier (issue #1368).
+///
+/// RFC 6962's Merkle Tree Hash decomposes a range of `n` leaves into a
+/// canonical sequence of *perfect* subtrees whose sizes are the powers of two
+/// present in the binary expansion of `n`. `FrontierPeak` records the root of
+/// one such perfect subtree, together with the subtree's height `level` (a
+/// subtree at level `k` spans `2^k` leaves).
+///
+/// The frontier for a player is the `Vec<FrontierPeak>` stored under
+/// [`DataKey::HistoryFrontier`]. Because the number of peaks is exactly the
+/// popcount of the leaf count, the frontier is bounded by 32 entries for any
+/// history a 32-bit index can address, and appending a leaf costs O(log n)
+/// hashes instead of O(n).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontierPeak {
+    /// Height of this perfect subtree: it spans `2^level` leaves. Level 0 is a
+    /// bare leaf hash.
+    pub level: u32,
+    /// Root hash of the perfect subtree (RFC 6962 `MTH` of those `2^level`
+    /// consecutive leaves).
+    pub hash: BytesN<32>,
+}
+
 /// Snapshot of all cross-contract peer addresses held by the progress
 /// contract. Returned by [`ProgressContract::get_wiring_state`].
 ///
@@ -131,6 +155,19 @@ pub enum DataKey {
     /// verifiable via `verify_history_proof` without trusting the RPC node
     /// that served the query — see `get_progress_root`.
     HistoryRoot(u64),
+    /// Incremental Merkle commitment state for a player's history (issue
+    /// #1368): the ordered list of [`FrontierPeak`]s whose levels are the set
+    /// bits of the current entry count.
+    ///
+    /// This is the accumulator `record_progress_entry` now maintains instead
+    /// of re-reading every `HistoryPage` shard and re-hashing the whole
+    /// history on each append. The RFC 6962 root in [`DataKey::HistoryRoot`]
+    /// remains byte-identical — it is now derived by folding these peaks
+    /// instead of by recursing over the full leaf list.
+    ///
+    /// Absent for players whose history predates this key; the first append
+    /// after an upgrade rebuilds it lazily from the existing history.
+    HistoryFrontier(u64),
 
     /// Boolean flag (`true`) written by `open_migration_window`; absent or
     /// `false` means the migration window is closed. All `admin_seed_*`
